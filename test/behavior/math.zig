@@ -1109,3 +1109,20 @@ test "signed zeros are represented properly" {
     try S.doTheTest();
     comptime try S.doTheTest();
 }
+
+test "float negation" {
+    if (builtin.zig_backend != .stage1) return error.SkipZigTest; // TODO
+
+    const S = struct {
+        fn doTheTest() !void {
+            inline for ([_]type{ f16, f32, f64, f80, f128 }) |T| {
+                var a: T = 1;
+                a = -a;
+                try expect(a == -1);
+            }
+        }
+    };
+
+    try S.doTheTest();
+    comptime try S.doTheTest();
+}

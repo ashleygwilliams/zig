@@ -315,7 +315,9 @@ pub fn generate(
     defer function.mir_extra.deinit(bin_file.allocator);
     defer if (builtin.mode == .Debug) function.mir_to_air_map.deinit();
 
-    var call_info = function.resolveCallingConventionValues(fn_type) catch |err| switch (err) {
+    var call_info = function.resolveCallingConventionValues(fn_type, .{
+        .is_extern_fn = false,
+    }) catch |err| switch (err) {
         error.CodegenFail => return FnResult{ .fail = function.err_msg.? },
         error.OutOfRegisters => return FnResult{
             .fail = try ErrorMsg.create(bin_file.allocator, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
@@ -1737,6 +1739,10 @@ fn load(self: *Self, dst_mcv: MCValue, ptr: MCValue, ptr_ty: Type) InnerError!vo
         .immediate => |imm| {
             try self.setRegOrMem(elem_ty, dst_mcv, .{ .memory = imm });
         },
+        .stack_offset => {
+            const reg = try self.copyToTmpRegister(ptr_ty, ptr);
+            try self.load(dst_mcv, .{ .register = reg }, ptr_ty);
+        },
         .ptr_stack_offset => |off| {
             try self.setRegOrMem(elem_ty, dst_mcv, .{ .stack_offset = off });
         },
@@ -1787,9 +1793,6 @@ fn load(self: *Self, dst_mcv: MCValue, ptr: MCValue, ptr_ty: Type) InnerError!vo
             const reg = try self.copyToTmpRegister(ptr_ty, ptr);
             try self.load(dst_mcv, .{ .register = reg }, ptr_ty);
         },
-        .stack_offset => {
-            return self.fail("TODO implement loading from MCValue.stack_offset", .{});
-        },
     }
 }
 
@@ -1831,6 +1834,10 @@ fn store(self: *Self, ptr: MCValue, value: MCValue, ptr_ty: Type, value_ty: Type
         .compare_flags_signed => unreachable,
         .immediate => |imm| {
             try self.setRegOrMem(value_ty, .{ .memory = imm }, value);
+        },
+        .stack_offset => {
+            const reg = try self.copyToTmpRegister(ptr_ty, ptr);
+            try self.store(.{ .register = reg }, value, ptr_ty, value_ty);
         },
         .ptr_stack_offset => |off| {
             try self.genSetStack(value_ty, off, value);
@@ -1908,6 +1915,10 @@ fn store(self: *Self, ptr: MCValue, value: MCValue, ptr_ty: Type, value_ty: Type
                         }).encode(),
                         .data = .{ .imm = 0 },
                     });
+                },
+                .stack_offset => {
+                    const tmp_reg = try self.copyToTmpRegister(value_ty, value);
+                    return self.store(ptr, .{ .register = tmp_reg }, ptr_ty, value_ty);
                 },
                 else => |other| {
                     return self.fail("TODO implement set pointee with {}", .{other});
@@ -2019,9 +2030,6 @@ fn store(self: *Self, ptr: MCValue, value: MCValue, ptr_ty: Type, value_ty: Type
                 },
                 else => return self.fail("TODO implement storing {} to MCValue.memory", .{value}),
             }
-        },
-        .stack_offset => {
-            return self.fail("TODO implement storing to MCValue.stack_offset", .{});
         },
     }
 }
@@ -2588,7 +2596,12 @@ fn airCall(self: *Self, inst: Air.Inst.Index) !void {
         else => unreachable,
     };
 
-    var info = try self.resolveCallingConventionValues(fn_ty);
+    var info = try self.resolveCallingConventionValues(fn_ty, .{
+        .is_extern_fn = blk: {
+            const val = self.air.value(callee) orelse break :blk false;
+            if (val.castTag(.extern_fn)) |_| break :blk true else break :blk false;
+        },
+    });
     defer info.deinit(self);
 
     var stack_adjustment: ?u32 = null;
@@ -3520,6 +3533,13 @@ fn genSetStackArg(self: *Self, ty: Type, stack_offset: i32, mcv: MCValue) InnerE
         .dead => unreachable,
         .ptr_embedded_in_code => unreachable,
         .unreach, .none => return,
+        .undef => {
+            if (abi_size <= 8) {
+                const reg = try self.copyToTmpRegister(ty, mcv);
+                return self.genSetStackArg(ty, stack_offset, MCValue{ .register = reg });
+            }
+            try self.genInlineMemset(stack_offset, .rsp, ty, .{ .immediate = 0xaa });
+        },
         .compare_flags_unsigned,
         .compare_flags_signed,
         => {
@@ -3598,7 +3618,6 @@ fn genSetStackArg(self: *Self, ty: Type, stack_offset: i32, mcv: MCValue) InnerE
 
             try self.genInlineMemcpy(stack_offset, .rsp, ty, mcv);
         },
-        else => return self.fail("TODO implement args on stack for {}", .{mcv}),
     }
 }
 
@@ -3617,7 +3636,7 @@ fn genSetStack(self: *Self, ty: Type, stack_offset: i32, mcv: MCValue) InnerErro
                 2 => return self.genSetStack(ty, stack_offset, .{ .immediate = 0xaaaa }),
                 4 => return self.genSetStack(ty, stack_offset, .{ .immediate = 0xaaaaaaaa }),
                 8 => return self.genSetStack(ty, stack_offset, .{ .immediate = 0xaaaaaaaaaaaaaaaa }),
-                else => return self.genInlineMemset(ty, stack_offset, .{ .immediate = 0xaa }),
+                else => return self.genInlineMemset(stack_offset, .rbp, ty, .{ .immediate = 0xaa }),
             }
         },
         .compare_flags_unsigned,
@@ -3943,12 +3962,20 @@ fn genInlineMemcpy(self: *Self, stack_offset: i32, stack_reg: Register, ty: Type
     try self.performReloc(loop_reloc);
 }
 
-fn genInlineMemset(self: *Self, ty: Type, stack_offset: i32, value: MCValue) InnerError!void {
+fn genInlineMemset(
+    self: *Self,
+    stack_offset: i32,
+    stack_register: Register,
+    ty: Type,
+    value: MCValue,
+) InnerError!void {
     try self.register_manager.getReg(.rax, null);
+
     const abi_size = ty.abiSize(self.target.*);
     if (stack_offset > 128) {
         return self.fail("TODO inline memset with large stack offset", .{});
     }
+
     const negative_offset = @bitCast(u32, -stack_offset);
 
     // We are actually counting `abi_size` bytes; however, we reuse the index register
@@ -4005,7 +4032,7 @@ fn genInlineMemset(self: *Self, ty: Type, stack_offset: i32, value: MCValue) Inn
             _ = try self.addInst(.{
                 .tag = .mov_mem_index_imm,
                 .ops = (Mir.Ops{
-                    .reg1 = .rbp,
+                    .reg1 = stack_register.to64(),
                 }).encode(),
                 .data = .{ .payload = payload },
             });
@@ -4700,7 +4727,9 @@ const CallMCValues = struct {
 };
 
 /// Caller must call `CallMCValues.deinit`.
-fn resolveCallingConventionValues(self: *Self, fn_ty: Type) !CallMCValues {
+fn resolveCallingConventionValues(self: *Self, fn_ty: Type, opts: struct {
+    is_extern_fn: bool,
+}) !CallMCValues {
     const cc = fn_ty.fnCallingConvention();
     const param_types = try self.gpa.alloc(Type, fn_ty.fnParamLen());
     defer self.gpa.free(param_types);
@@ -4731,20 +4760,40 @@ fn resolveCallingConventionValues(self: *Self, fn_ty: Type) !CallMCValues {
             var next_int_reg: usize = 0;
             var by_reg = std.AutoHashMap(usize, usize).init(self.bin_file.allocator);
             defer by_reg.deinit();
-            for (param_types) |ty, i| {
-                if (!ty.hasRuntimeBits()) continue;
-                const param_size = @intCast(u32, ty.abiSize(self.target.*));
-                const pass_in_reg = switch (ty.zigTypeTag()) {
-                    .Bool => true,
-                    .Int, .Enum => param_size <= 8,
-                    .Pointer => ty.ptrSize() != .Slice,
-                    .Optional => ty.isPtrLikeOptional(),
-                    else => false,
-                };
-                if (pass_in_reg) {
-                    if (next_int_reg >= c_abi_int_param_regs.len) break;
-                    try by_reg.putNoClobber(i, next_int_reg);
-                    next_int_reg += 1;
+
+            // If we want debug output, we store all args on stack for better liveness of args
+            // in debugging contexts such as previewing the args in the debugger anywhere in
+            // the procedure. Passing the args via registers can lead to reusing the register
+            // for local ops thus clobbering the input arg forever.
+            // This of course excludes C ABI calls.
+            const omit_args_in_registers = blk: {
+                if (opts.is_extern_fn) break :blk false;
+                switch (self.bin_file.options.optimize_mode) {
+                    .Debug => break :blk true,
+                    else => break :blk false,
+                }
+            };
+            if (!omit_args_in_registers) {
+                for (param_types) |ty, i| {
+                    if (!ty.hasRuntimeBits()) continue;
+                    const param_size = @intCast(u32, ty.abiSize(self.target.*));
+                    // For simplicity of codegen, slices and other types are always pushed onto the stack.
+                    // TODO: look into optimizing this by passing things as registers sometimes,
+                    // such as ptr and len of slices as separate registers.
+                    // TODO: also we need to honor the C ABI for relevant types rather than passing on
+                    // the stack here.
+                    const pass_in_reg = switch (ty.zigTypeTag()) {
+                        .Bool => true,
+                        .Int, .Enum => param_size <= 8,
+                        .Pointer => ty.ptrSize() != .Slice,
+                        .Optional => ty.isPtrLikeOptional(),
+                        else => false,
+                    };
+                    if (pass_in_reg) {
+                        if (next_int_reg >= c_abi_int_param_regs.len) break;
+                        try by_reg.putNoClobber(i, next_int_reg);
+                        next_int_reg += 1;
+                    }
                 }
             }
 
@@ -4765,11 +4814,6 @@ fn resolveCallingConventionValues(self: *Self, fn_ty: Type) !CallMCValues {
                     result.args[i] = .{ .register = aliased_reg };
                     next_int_reg += 1;
                 } else {
-                    // For simplicity of codegen, slices and other types are always pushed onto the stack.
-                    // TODO: look into optimizing this by passing things as registers sometimes,
-                    // such as ptr and len of slices as separate registers.
-                    // TODO: also we need to honor the C ABI for relevant types rather than passing on
-                    // the stack here.
                     const offset = mem.alignForwardGeneric(u32, next_stack_offset + param_size, param_align);
                     result.args[i] = .{ .stack_offset = @intCast(i32, offset) };
                     next_stack_offset = offset;
